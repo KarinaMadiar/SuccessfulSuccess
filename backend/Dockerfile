@@ -22,10 +22,16 @@ RUN if [ "$INSTALL_DEV" = "true" ]; then uv sync --no-install-project; \
 
 COPY . .
 
+# Installed outside /app, so the compose bind mount of ./backend cannot shadow
+# it, with any CRLF line endings stripped: a Windows checkout without
+# .gitattributes would otherwise fail with "exec /app/entrypoint.sh: no such file".
+RUN sed 's/\r$//' entrypoint.sh > /usr/local/bin/entrypoint.sh \
+    && chmod 755 /usr/local/bin/entrypoint.sh
+
 RUN useradd --create-home --uid 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

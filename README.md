@@ -75,6 +75,44 @@ make psql        # psql shell against the app database
 make help        # everything else
 ```
 
+## Windows
+
+The same `make` targets work on Windows, with Docker Desktop (WSL 2 backend)
+and [Git for Windows](https://git-scm.com/download/win) installed. Add GNU make
+once:
+
+```powershell
+winget install ezwinports.make
+```
+
+Then, from PowerShell, Windows Terminal or Git Bash:
+
+```powershell
+Copy-Item .env.example .env
+make up-build
+```
+
+Every recipe runs in Git's bash (`C:/Program Files/Git` by default; pass
+`GIT_HOME=...` if it is installed elsewhere), so `make test`, `make seed`, the
+`aws-*` targets and the rest behave as on macOS and Linux. Inside WSL, plain
+`make` works as on Linux.
+
+Things that are already taken care of, and why:
+
+- `.gitattributes` checks every file out with LF line endings. Git on Windows
+  converts to CRLF by default, and a CRLF `entrypoint.sh` stops the backend
+  container with `exec /app/entrypoint.sh: no such file or directory`. A clone
+  made before `.gitattributes` existed keeps its CRLF files until you run
+  `git rm --cached -r . && git reset --hard` (this discards local changes).
+- File-change events from a Windows folder do not reach the containers, so hot
+  reload polls: `WATCHPACK_POLLING` for Next.js, `WATCHFILES_FORCE_POLLING` for
+  uvicorn. For faster reloads keep the clone inside WSL rather than on `C:\`.
+- Git's bash rewrites arguments that look like paths (`/aws` becomes
+  `C:/Program Files/Git/aws`); the Makefile turns that off with
+  `MSYS_NO_PATHCONV`.
+- Keep `.env` with LF line endings (copying `.env.example` does): `make` reads
+  it directly, and a CRLF `.env` leaves a stray `\r` on every value.
+
 ## Deploy to AWS
 
 `infra/` holds four CloudFormation templates: `auth.yml` (Cognito sign-in),

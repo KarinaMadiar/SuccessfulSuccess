@@ -26,6 +26,9 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       RUN_MIGRATIONS_ON_START: ${RUN_MIGRATIONS_ON_START:-true}
+      # File events from a Windows (or some VM) bind mount never reach the
+      # container, so --reload polls instead — the backend twin of WATCHPACK_POLLING.
+      WATCHFILES_FORCE_POLLING: "true"
       # From `make aws-auth-env`; the API refuses meetings requests without them.
       COGNITO_REGION: ${AWS_REGION:-us-east-1}
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}

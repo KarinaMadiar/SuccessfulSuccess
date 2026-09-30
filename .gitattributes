@@ -1,0 +1,4 @@
+# Check every text file out with LF, on Windows too. The shell scripts, the
+# Makefile and .env run inside Linux containers or a POSIX shell, and a CRLF
+# checkout (git's default with core.autocrlf=true) breaks them: /bin/sh^M.
+* text=auto eol=lf
