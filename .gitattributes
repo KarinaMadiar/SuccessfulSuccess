@@ -2,3 +2,7 @@
 # Makefile and .env run inside Linux containers or a POSIX shell, and a CRLF
 # checkout (git's default with core.autocrlf=true) breaks them: /bin/sh^M.
 * text=auto eol=lf
+
+# cmd.exe misreads labels and gotos in LF batch files.
+*.cmd text eol=crlf
+*.bat text eol=crlf

@@ -78,19 +78,19 @@ make help        # everything else
 ## Windows
 
 The same `make` targets work on Windows, with Docker Desktop (WSL 2 backend)
-and [Git for Windows](https://git-scm.com/download/win) installed. Add GNU make
-once:
-
-```powershell
-winget install ezwinports.make
-```
-
-Then, from PowerShell, Windows Terminal or Git Bash:
+and [Git for Windows](https://git-scm.com/download/win) installed. There is no
+need to install GNU make first: `make.cmd` in the repository root runs the
+Makefile, and when `make.exe` is missing it offers to install it with winget
+(`ezwinports.make`) and carries on.
 
 ```powershell
 Copy-Item .env.example .env
-make up-build
+.\make help        # PowerShell only runs scripts from the current folder with .\
+.\make up-build
 ```
+
+In `cmd.exe`, plain `make help` finds `make.cmd`; once make is installed,
+`make help` works everywhere.
 
 Every recipe runs in Git's bash (`C:/Program Files/Git` by default; pass
 `GIT_HOME=...` if it is installed elsewhere), so `make test`, `make seed`, the
