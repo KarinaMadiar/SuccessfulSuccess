@@ -198,7 +198,12 @@ repo:KarinaMadiar@269516340/SuccessfulSuccess@1398660644:ref:refs/heads/main
 That immutable subject permits only this repository's `main` branch to assume
 the role; it does not trust the upstream repository, other forks, branches, or
 pull requests. The role can push images to this project's ECR repository and
-update/invoke only its backend Lambda stack/function.
+update/invoke only its backend Lambda stack/function. It also has read-only
+`ec2:DescribeSecurityGroups`, `ec2:DescribeSubnets`, and `ec2:DescribeVpcs`
+access so CloudFormation can validate the Lambda's VPC configuration during
+image updates. It can describe only this project's RDS instance to resolve its
+Lambda endpoint. It can read and pass only the generated backend Lambda
+execution role, and only to `lambda.amazonaws.com`.
 
 ### 1. Backend — Lambda function URL, RDS PostgreSQL
 
