@@ -125,14 +125,12 @@ Docker (`AWS=aws make aws-deploy` uses a local CLI instead, which is noticeably
 faster).
 
 ```
-browser ──https──→ CloudFront (optional custom domain) → private S3 bucket (Next.js static export)
-   └────https──→ Lambda function URL → Lambda → Aurora Serverless v2 :5432
+browser ──https──→ Lambda function URL (static Next.js + FastAPI) → private RDS PostgreSQL :5432
 ```
 
-Every resource lives in `AWS_REGION`, **us-east-1** by default, which is also
-where CloudFront reads its certificates from. There is no API Gateway or load
-balancer: the browser calls the API on its function URL, and FastAPI's CORS
-settings allow it.
+Every resource lives in `AWS_REGION`, **us-east-1** by default. There is no
+CloudFront, API Gateway, public S3 bucket, or load balancer. The static frontend
+and API share one HTTPS Lambda function URL and origin.
 
 Every stack is tagged `PROJECT_NAME=<value of PROJECT_NAME>`, and every resource
 that accepts tags also carries it explicitly in the templates. Filter by it in
@@ -142,18 +140,19 @@ Cost Explorer or Resource Groups to see everything the project owns.
 
 ```bash
 make aws-whoami   # check the credentials work
-make aws-deploy   # sign-in, then the backend, then the frontend built against both
+make aws-deploy   # deploy Cognito, API and frontend on one HTTPS URL
 ```
 
-`aws-deploy` runs `aws-deploy-auth` and then the two steps below in order: the
-backend checks tokens from the user pool, and the frontend bakes the API URL and
-the pool's ids into its build. Each step can also run on its own.
+`aws-deploy` creates Cognito, builds the frontend into the Lambda image, deploys
+the API and frontend together, then updates Cognito with the function URL for
+Google sign-in callbacks. `aws-deploy-frontend` repeats that combined build and
+deploy when frontend code changes.
 
 The backend Lambda sits in a VPC with no internet access, so it cannot download
 the pool's signing keys itself; `aws-deploy-backend` fetches them
 (`<issuer>/.well-known/jwks.json`) and passes them in as `COGNITO_JWKS`.
-`aws-deploy-frontend` re-deploys the auth stack once the CloudFront URL exists,
-so Cognito may redirect back to the site after Google sign-in.
+The frontend uses relative `/api/v1` URLs, so production requests stay on the
+same HTTPS origin and need no separate CORS configuration.
 
 Fill these in `.env` first:
 
@@ -163,36 +162,64 @@ AWS_SECRET_ACCESS_KEY=...
 AWS_REGION=us-east-1
 PROJECT_NAME=successfulsuccess   # prefixes every resource name, and the PROJECT_NAME tag
 AWS_DB_PASSWORD=...          # 8-41 chars, [A-Za-z0-9_-] only
-AWS_CORS_ORIGINS=            # empty: follow the frontend's URLs (* until it exists)
+AWS_CORS_ORIGINS=            # empty: use CORS_ORIGINS for local development
 GOOGLE_CLIENT_ID=            # optional: Google sign-in (see "Sign-in" above)
 GOOGLE_CLIENT_SECRET=
-AWS_FRONTEND_DOMAIN=         # optional, e.g. app.example.com
 ```
 
-### 1. Backend — Lambda function URL, Aurora Serverless v2
+### GitHub Actions deployment
+
+The `CI/CD` workflow runs backend Ruff checks and tests plus frontend ESLint on
+pushes to `main`. Only after those checks pass does it build the combined
+frontend/API Lambda image, push it to ECR tagged with the full commit SHA, and
+update the Lambda stack through CloudFormation. Roll back to an earlier image
+with `make aws-deploy-image IMAGE_TAG=<full-commit-sha>`; the ECR lifecycle rule
+retains the five most recent images.
+
+Bootstrap the deploy role once from PowerShell using the AWS credentials in
+your local `.env`:
+
+```powershell
+.\make aws-deploy-github-actions
+.\make aws-github-actions-role-arn
+```
+
+The bootstrap identity needs permission to create the GitHub OIDC provider and
+IAM role. Copy the printed ARN into the GitHub repository's **Settings → Secrets
+and variables → Actions → Variables** as `AWS_ROLE_ARN`. It is an identifier,
+not a secret. The workflow needs no AWS access-key secrets.
+
+The role's trust policy requires `aud=sts.amazonaws.com` and this exact `sub`:
+
+```text
+repo:KarinaMadiar@269516340/SuccessfulSuccess@1398660644:ref:refs/heads/main
+```
+
+That immutable subject permits only this repository's `main` branch to assume
+the role; it does not trust the upstream repository, other forks, branches, or
+pull requests. The role can push images to this project's ECR repository and
+update/invoke only its backend Lambda stack/function.
+
+### 1. Backend — Lambda function URL, RDS PostgreSQL
 
 ```bash
 make aws-deploy-backend   # ECR + build & push + create/update the stack + migrate, prints the URL
 ```
 
-The API runs as a **Lambda function** from a container image
-(`backend/Dockerfile.lambda`): the same FastAPI app, adapted to Lambda by
-[Mangum](https://github.com/Kludex/mangum) in `app/lambda_handler.py`. Requests
-reach it through its **function URL** (`https://<id>.lambda-url.<region>.on.aws`),
-Lambda's own public HTTPS endpoint, and that URL is the backend URL the frontend
-is built with. FastAPI keeps doing the routing, CORS and error envelope exactly
-as it does locally. `backend/Dockerfile` stays the local/compose image.
+The app runs as one **Lambda function** from a container image
+(`backend/Dockerfile.lambda`): FastAPI is adapted to Lambda by
+[Mangum](https://github.com/Kludex/mangum) in `app/lambda_handler.py`, and serves
+the Next.js static export from the same image. The function URL
+(`https://<id>.lambda-url.<region>.on.aws`) is both the website and API origin.
+`backend/Dockerfile` stays the local/compose image.
 
-The database is an **Aurora Serverless v2** PostgreSQL cluster with one
-`db.serverless` writer at the smallest size Aurora allows: it scales between
-0 and 1 ACU (`DbMinCapacity`, `DbMaxCapacity`) and **pauses after 5 idle
-minutes** (also the minimum), so an unused deployment
-pays only for storage. The first connection after a pause waits ~15 s while it
-resumes; the function's 60 s timeout covers that.
+The database is a **single-AZ RDS for PostgreSQL** instance (`db.t4g.micro`)
+with 20 GiB of encrypted `gp3` storage. It stays running rather than pausing
+when idle; the Free account plan's eligibility and usage limits apply.
 
-The function sits in the account's **default VPC**, next to the cluster, so the
-database is never public: its security group only accepts the function's. The
-function needs nothing else on the network, so there is no NAT gateway.
+The function sits in the account's **default VPC**, next to the database, so the
+database is never public: its security group only accepts the function's. Static
+assets and API requests share the same Lambda; the function needs no NAT gateway.
 
 Migrations run in the same function: invoked directly with
 `{"action": "migrate"}` it applies them instead of serving a request. Function
@@ -200,14 +227,15 @@ URL events never carry that key, so no web request can trigger it.
 `make aws-deploy-backend` invokes it after every deploy, so migrations run once
 per deploy rather than racing on each cold start.
 
-The first deploy takes ~15 minutes; Aurora is the slow part. It is idempotent —
-run it again to ship a new version. The image is passed to the stack by digest,
-not by tag, so every push really does update the function. If the stack is
-still busy with an earlier update, the target waits for it rather than failing.
+The first deploy takes several minutes while RDS provisions the instance. It is
+idempotent — run it again to ship a new version. The image is passed to the
+stack by digest, not by tag, so every push really does update the function. If
+the stack is still busy with an earlier update, the target waits for it rather
+than failing.
 
 | Command | What it does |
 |---------|--------------|
-| `make aws-url` | Print the API URL (`/docs` for Swagger, `/health` for the check) |
+| `make aws-url` | Print the app/API URL (`/`, `/docs`, and `/health`) |
 | `make aws-status` | Stack outputs plus the API function's state |
 | `make aws-logs` | Follow the function logs from CloudWatch |
 | `make aws-migrate` | Apply migrations again on their own |
@@ -219,77 +247,26 @@ natively on Apple Silicon. The image platform follows this variable, so the two
 cannot drift apart. The build passes `--provenance=false` because Lambda rejects
 the multi-manifest image index that BuildKit otherwise pushes.
 
-### 2. Frontend — S3 + CloudFront
+### 2. Frontend — served by the Lambda function URL
 
 ```bash
-make aws-deploy-frontend   # create/update the stack, build against the API URL, upload
-make aws-frontend-url      # print the site URL
+make aws-deploy-frontend   # rebuild and deploy the combined frontend/API image
+make aws-frontend-url      # print the shared site/API URL
 ```
 
-The target refuses to run until the backend stack exists. It reads the
-backend's function URL from that stack, builds the Next.js **static export** in
-Docker with `NEXT_PUBLIC_API_BASE_URL` set to it, syncs the files to a
-**private S3 bucket** and invalidates the **CloudFront** distribution in front
-of it. The site is served over HTTPS at `https://<id>.cloudfront.net`. A new
-distribution takes ~5 minutes to come up.
-
-- The distribution is on CloudFront's **flat-rate Free plan**
-  (`AWS::PricingPlanManager::Subscription`): $0 a month for 1M requests and
-  100 GB, with no overage charges, WAF and DDoS protection included. The plan
-  requires a web ACL of its own, so the stack creates one that allows
-  everything. AWS allows 3 Free plans per account and refuses them while the
-  account is on the AWS Free Tier; set `AWS_CLOUDFRONT_PLAN=PAY_AS_YOU_GO` there.
-  `PricingPlanStatus` in the stack outputs reads `ACTIVE` once it applies.
-- The bucket blocks all public access. CloudFront reads it through **origin
-  access control**, and the bucket policy admits only this distribution.
-- The export is built with `trailingSlash`, so each route is a folder with an
-  `index.html` (`/meetings/new/`). A small CloudFront Function maps clean URLs
-  onto those files, since S3's REST endpoint has no index documents. Anything
-  missing gets the export's `404.html` with a 404 status.
-  `output` stays `standalone` for the compose/production image and switches to
-  `export` only when `NEXT_OUTPUT=export` is set, which is the deploy target's
-  job.
-- HTML is uploaded with `no-cache` and the hashed assets with a one-year
-  immutable header, and every deploy invalidates `/*`, so a new version shows up
-  on the next page load.
-- With `AWS_CORS_ORIGINS` empty, the backend allows exactly the frontend's
-  origins (the CloudFront URL and the custom domain). On the very first
-  `make aws-deploy` the frontend does not exist yet, so the API starts with `*`;
-  the frontend step says so, and the next `make aws-deploy-backend` locks it down.
-
-### 3. Custom domain for the frontend (optional)
-
-```bash
-# .env
-AWS_FRONTEND_DOMAIN=app.example.com
-
-make aws-frontend-cert      # request + DNS-validate the certificate in us-east-1
-make aws-deploy-frontend    # attach the domain to the distribution
-make aws-deploy-backend     # add the new origin to the API's CORS
-```
-
-CloudFront only reads ACM certificates from **us-east-1**, and that is where
-everything is deployed. `make aws-frontend-cert` (`infra/certificate.sh`) reuses
-an issued or pending certificate for the domain, or requests one, then waits for
-DNS validation. If the domain's Route 53 hosted zone is in this account, it
-writes the validation record itself, and the frontend stack adds the A/AAAA
-alias records pointing at the distribution. Otherwise both print the records
-to add at your DNS provider: the validation CNAME, then a CNAME from the domain
-to the distribution's `*.cloudfront.net` name.
-
-The API keeps its function URL: a function URL cannot take a custom domain.
+The Next.js **static export** is built with Cognito settings and bundled into the
+Lambda container image. FastAPI serves route `index.html` files, JavaScript,
+styles, and images alongside `/api/v1`, all from the same HTTPS function URL.
+This avoids CloudFront account verification and separate production CORS
+configuration. Function URLs do not support custom domains.
 
 ### Cost
 
-- **Lambda** — 1M requests and 400,000 GB-seconds a month, always free. The
-  function URL costs nothing beyond the invocation.
-- **Aurora Serverless v2** is not in the free tier. It bills per ACU-hour while
-  awake, nothing for compute while paused, plus storage and I/O. A demo that
-  sits idle costs cents a month.
-- **CloudFront** — the flat-rate Free plan: $0, 1M requests and 100 GB a month,
-  never an overage charge (traffic past it may be slowed, not billed).
-  **S3** — 5 GB and 20,000 GETs in the free tier; CloudFront caches most reads.
-  ACM certificates are free.
+- **Lambda** — 1M requests and 400,000 GB-seconds a month, always free. Each
+  page, API call, and static asset request invokes the function.
+- **RDS PostgreSQL** is a continuously running instance plus storage. Check the
+  AWS Free Tier page and account-plan limits for current eligibility; after
+  allowances or plan changes, normal RDS charges apply.
 - **ECR** — 500 MB in the free tier; the lifecycle policy keeps five images.
 
 `make aws-destroy` deletes everything, database included, with no snapshot left
@@ -298,13 +275,13 @@ tier — check your billing console rather than assuming.
 
 ### Known trade-offs
 
-- **No custom domain on the API**: function URLs cannot take one. Putting one on
-  it would need API Gateway or a second CloudFront distribution in front.
+- **No custom domain**: Lambda function URLs cannot take one. A custom domain
+  would require another HTTPS entry point, such as API Gateway or CloudFront.
 - The database password reaches the function as a plain environment variable.
   Moving it to SSM Parameter Store or Secrets Manager is the first thing to
   harden.
 - **Cold starts**: the first request after a few idle minutes waits ~1–2 s while
-  Lambda starts the container, and up to ~15 s more if Aurora has paused.
+  Lambda starts the container. The database itself does not pause.
 - Every warm instance holds one database connection. Nothing is reserved by
   default (`MaxConcurrency=0`): new accounts have a Lambda concurrency limit of
   10 in total and Lambda refuses to reserve any of it, so that limit is the cap,
@@ -321,7 +298,7 @@ tier — check your billing console rather than assuming.
   pre-sign-up Lambda trigger.
 - Deleting the backend stack takes ~20 minutes: Lambda releases its VPC network
   interfaces slowly, and the security groups wait for them.
-- One Aurora instance: there is no reader to fail over to.
+- One RDS instance: there is no standby to fail over to.
 
 ## API
 

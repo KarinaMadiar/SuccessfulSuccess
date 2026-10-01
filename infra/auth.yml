@@ -17,7 +17,7 @@ Parameters:
     Description: >-
       Every URL the site is served from, each ending in "/": Cognito sends
       people back there after signing in with Google or signing out. Include
-      the local dev server and the CloudFront site.
+      the local dev server and the deployed Lambda function URL.
 
   GoogleClientId:
     Type: String

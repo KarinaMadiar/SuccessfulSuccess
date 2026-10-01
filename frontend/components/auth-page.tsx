@@ -512,7 +512,7 @@ export function AuthPage() {
 
   // Signed in already, or just now: straight to the app.
   useEffect(() => {
-    if (status === "signedIn") router.replace("/today")
+    if (status === "signedIn") router.replace("/")
   }, [status, router])
 
   const onGoogle = async () => {

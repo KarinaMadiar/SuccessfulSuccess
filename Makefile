@@ -18,7 +18,7 @@ endif
 # the shell, so override one on the command line instead: make aws-deploy-backend
 # AWS_LAMBDA_ARCH=arm64
 -include .env
-# Every stack (ECR, Lambda, Aurora, S3 + CloudFront) is created in this one region.
+# Every stack (Cognito, ECR, Lambda and RDS) is created in this one region.
 AWS_REGION ?= us-east-1
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION PROJECT_NAME
 # On Windows, stop Git's bash rewriting container paths such as /aws or
@@ -48,10 +48,6 @@ IMAGE_PLATFORM = $(if $(filter arm64,$(AWS_LAMBDA_ARCH)),linux/arm64,linux/amd64
 # that supports tags, so Cost Explorer and Resource Groups can find the project.
 STACK_TAGS = --tags "PROJECT_NAME=$(PROJECT_NAME)"
 
-# infra/certificate.sh reuses the CLI configured above. CloudFront only reads
-# certificates from us-east-1, so that is where the frontend's goes.
-CERT = AWS_CLI="$(AWS)" AWS_CERT_REGION=us-east-1 infra/certificate.sh
-
 # $(call stack-output,<stack>,<output key>)
 stack-output = $(AWS) cloudformation describe-stacks --stack-name $(1) \
 	--query 'Stacks[0].Outputs[?OutputKey==`$(2)`].OutputValue' --output text
@@ -66,18 +62,20 @@ stack-outputs = $(AWS) cloudformation describe-stacks --stack-name $(1) \
 # $(call wait-stack-idle,<stack>)
 wait-stack-idle = while status=$$($(AWS) cloudformation describe-stacks --stack-name $(1) \
 		--query 'Stacks[0].StackStatus' --output text 2>/dev/null | tr -d '[:space:]'); \
-		case "$$status" in *_IN_PROGRESS) true ;; *) false ;; esac; do \
+		case "$$status" in REVIEW_IN_PROGRESS) false ;; *_IN_PROGRESS) true ;; *) false ;; esac; do \
 		echo "$(1) is $$status — waiting for it to settle..."; sleep 30; done
 
-# A stack whose first create failed sits in ROLLBACK_COMPLETE, which
-# CloudFormation can only delete. It holds no resources, so clear it and let the
-# deploy start over.
+# A failed create can leave ROLLBACK_COMPLETE, while a rejected initial change
+# set leaves REVIEW_IN_PROGRESS. Neither has deployed resources, so clear it.
 # $(call clear-failed-create,<stack>)
-clear-failed-create = if [ "$$($(AWS) cloudformation describe-stacks --stack-name $(1) \
-		--query 'Stacks[0].StackStatus' --output text 2>/dev/null | tr -d '[:space:]')" = ROLLBACK_COMPLETE ]; then \
-		echo "$(1) failed to create earlier — deleting it before retrying"; \
+clear-failed-create = status=$$($(AWS) cloudformation describe-stacks --stack-name $(1) \
+		--query 'Stacks[0].StackStatus' --output text 2>/dev/null | tr -d '[:space:]'); \
+	case "$$status" in \
+		ROLLBACK_COMPLETE|REVIEW_IN_PROGRESS) \
+		echo "$(1) is $$status from an unsuccessful create — deleting it before retrying"; \
 		$(AWS) cloudformation delete-stack --stack-name $(1) && \
-		$(AWS) cloudformation wait stack-delete-complete --stack-name $(1); fi
+		$(AWS) cloudformation wait stack-delete-complete --stack-name $(1) ;; \
+	esac
 
 # Fail early and clearly when .env has no credentials in it.
 define require-aws-credentials
@@ -93,8 +91,10 @@ define require-db-password
 endef
 
 .PHONY: help up up-build down down-v logs ps migrate revision seed test lint fmt shell-backend psql \
-        aws-whoami aws-deploy aws-deploy-auth aws-auth-env aws-ecr aws-push aws-deploy-backend aws-migrate aws-url aws-status aws-logs \
-        aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-destroy
+	deploy-backend deploy-frontend \
+	aws-whoami aws-deploy aws-deploy-auth aws-auth-env aws-ecr aws-push aws-push-image aws-deploy-backend aws-deploy-image aws-migrate aws-url aws-status aws-logs \
+	aws-github-oidc-provider aws-deploy-github-actions aws-github-actions-role-arn \
+		aws-deploy-frontend aws-frontend-url aws-destroy
 
 help:
 	@grep -hE '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -146,20 +146,57 @@ shell-backend: ## Open a shell in the backend container
 psql: ## Open psql against the application database
 	$(COMPOSE) exec db psql -U app -d meetings
 
+deploy-backend: ## Deploy the backend using the same contract as the AWS deployment
+	@$(MAKE) --no-print-directory aws-deploy-backend
+
+deploy-frontend: ## Build and deploy the frontend using the same contract as the AWS deployment
+	@$(MAKE) --no-print-directory aws-deploy-frontend
+
 aws-whoami: ## Verify the AWS credentials in .env
 	$(require-aws-credentials)
 	$(AWS) sts get-caller-identity
 
-aws-deploy: ## Deploy everything: sign-in, then the backend, then the frontend built against both
-	@$(MAKE) --no-print-directory aws-deploy-auth
-	@$(MAKE) --no-print-directory aws-deploy-backend
+aws-github-oidc-provider: ## Ensure GitHub's OIDC provider exists in this AWS account
+	$(require-aws-credentials)
+	@account=$$($(AWS) sts get-caller-identity --query Account --output text); \
+		provider="arn:aws:iam::$$account:oidc-provider/token.actions.githubusercontent.com"; \
+		found=$$($(AWS) iam list-open-id-connect-providers --query "OpenIDConnectProviderList[?Arn=='$$provider'].Arn" --output text); \
+		if [ -z "$$found" ] || [ "$$found" = "None" ]; then \
+			$(AWS) iam create-open-id-connect-provider \
+				--url https://token.actions.githubusercontent.com \
+				--client-id-list sts.amazonaws.com \
+				--tags Key=PROJECT_NAME,Value=$(PROJECT_NAME); \
+		else \
+			clients=$$($(AWS) iam get-open-id-connect-provider \
+				--open-id-connect-provider-arn "$$provider" \
+				--query ClientIDList --output text | tr '\t' ' '); \
+			case " $$clients " in *" sts.amazonaws.com "*) ;; *) \
+				$(AWS) iam add-client-id-to-open-id-connect-provider \
+					--open-id-connect-provider-arn "$$provider" \
+					--client-id sts.amazonaws.com ;; esac; \
+		fi
+
+aws-deploy-github-actions: aws-github-oidc-provider ## Create the least-privilege GitHub Actions OIDC role
+	$(require-aws-credentials)
+	$(AWS) cloudformation deploy \
+		--stack-name $(PROJECT_NAME)-github-actions \
+		--template-file infra/github-actions.yml \
+		--capabilities CAPABILITY_NAMED_IAM \
+		--no-fail-on-empty-changeset \
+		$(STACK_TAGS) \
+		--parameter-overrides "ProjectName=$(PROJECT_NAME)"
+
+aws-github-actions-role-arn: ## Print the role ARN to add as the GitHub AWS_ROLE_ARN variable
+	@$(call stack-output,$(PROJECT_NAME)-github-actions,RoleArn)
+
+aws-deploy: ## Deploy Cognito, API and static frontend on one HTTPS Lambda URL
 	@$(MAKE) --no-print-directory aws-deploy-frontend
 
 aws-deploy-auth: ## Create/update the Cognito user pool (email + password; Google when GOOGLE_CLIENT_ID is set)
 	$(require-aws-credentials)
 	@urls="http://localhost:$(or $(FRONTEND_PORT),3000)/"; \
-		site=$$($(call stack-output,$(FRONTEND_STACK),AllowedOrigins) 2>/dev/null | tr -d '[:space:]'); \
-		case "$$site" in ""|None) ;; *) urls="$$urls,$$(echo "$$site" | sed 's|,|/,|g')/" ;; esac; \
+		site=$$($(call stack-output,$(APP_STACK),ApiUrl) 2>/dev/null | tr -d '[:space:]'); \
+		case "$$site" in ""|None) ;; *) urls="$$urls,$$site/" ;; esac; \
 		echo "Sign-in redirect URLs: $$urls"; \
 		test -n "$(GOOGLE_CLIENT_ID)" || echo "GOOGLE_CLIENT_ID is empty — Google sign-in stays off"; \
 		$(call wait-stack-idle,$(AUTH_STACK)); \
@@ -196,16 +233,31 @@ aws-ecr: ## Create the ECR repository for the backend image
 		$(STACK_TAGS) \
 		--parameter-overrides "ProjectName=$(PROJECT_NAME)"
 
-aws-push: aws-ecr ## Build the backend Lambda image and push it to ECR
+aws-push: aws-ecr ## Ensure ECR exists, then build and push the API + frontend image
+	@$(MAKE) --no-print-directory aws-push-image IMAGE_TAG="$(IMAGE_TAG)"
+
+aws-push-image: ## Build and push the API + static frontend image without managing ECR
 	$(require-aws-credentials)
-	@repo=$$($(call stack-output,$(ECR_STACK),RepositoryUri) | tr -d '[:space:]'); \
+	@auth=$$($(call stack-outputs,$(AUTH_STACK)) | tr -d '\r'); \
+		auth_out() { printf '%s\n' "$$auth" | awk -F '\t' -v k="$$1" '$$1 == k { print $$2 }'; }; \
+		test -n "$$(auth_out UserPoolId)" || { echo "No Cognito user pool — run: make aws-deploy-auth"; exit 1; }; \
+		echo "Building static frontend for the Lambda URL"; \
+		rm -rf frontend/out; \
+		docker build --target export --output type=local,dest=frontend/out \
+			--build-arg NEXT_PUBLIC_API_BASE_URL= \
+			--build-arg NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$(auth_out UserPoolId)" \
+			--build-arg NEXT_PUBLIC_COGNITO_CLIENT_ID="$$(auth_out UserPoolClientId)" \
+			--build-arg NEXT_PUBLIC_COGNITO_DOMAIN="$$(auth_out HostedDomain)" \
+			--build-arg NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$(auth_out GoogleEnabled)" \
+			./frontend || exit 1; \
+		repo=$$($(call stack-output,$(ECR_STACK),RepositoryUri) | tr -d '[:space:]'); \
 		echo "Pushing $$repo:$(IMAGE_TAG) ($(IMAGE_PLATFORM))"; \
 		$(AWS) ecr get-login-password | docker login --username AWS --password-stdin "$${repo%%/*}"; \
 		docker build --platform $(IMAGE_PLATFORM) --provenance=false \
-			-f backend/Dockerfile.lambda -t "$$repo:$(IMAGE_TAG)" ./backend; \
+			-f backend/Dockerfile.lambda -t "$$repo:$(IMAGE_TAG)" .; \
 		docker push "$$repo:$(IMAGE_TAG)"
 
-aws-deploy-backend: aws-push ## Deploy the backend to AWS (Lambda function URL + Aurora Serverless), then migrate
+aws-deploy-backend: aws-push ## Deploy the backend to AWS (Lambda function URL + RDS PostgreSQL), then migrate
 	$(require-aws-credentials)
 	$(require-db-password)
 	@pool=$$($(call stack-output,$(AUTH_STACK),UserPoolId) 2>/dev/null | tr -d '[:space:]'); \
@@ -226,12 +278,9 @@ aws-deploy-backend: aws-push ## Deploy the backend to AWS (Lambda function URL +
 			--image-ids imageTag=$(IMAGE_TAG) --query 'imageDetails[0].imageDigest' \
 			--output text | tr -d '[:space:]'); \
 		cors="$(AWS_CORS_ORIGINS)"; \
-		if [ -z "$$cors" ]; then \
-			cors=$$($(call stack-output,$(FRONTEND_STACK),AllowedOrigins) 2>/dev/null | tr -d '[:space:]'); \
-			case "$$cors" in ""|None) cors='*' ;; esac; \
-		fi; \
+		if [ -z "$$cors" ]; then cors="$(or $(CORS_ORIGINS),http://localhost:3000)"; fi; \
 		echo "vpc=$$vpc subnets=$$subnets image=$$repo@$$digest cors=$$cors"; \
-		echo "This takes ~15 minutes the first time (Aurora is the slow part)."; \
+		echo "The first RDS instance can take several minutes to become available."; \
 		$(call wait-stack-idle,$(APP_STACK)); \
 		$(call clear-failed-create,$(APP_STACK)); \
 		$(AWS) cloudformation deploy \
@@ -252,6 +301,31 @@ aws-deploy-backend: aws-push ## Deploy the backend to AWS (Lambda function URL +
 				"CognitoUserPoolId=$$pool" \
 				"CognitoClientId=$$client" \
 				"CognitoJwks=$$jwks"
+	@$(MAKE) --no-print-directory aws-migrate
+	@$(MAKE) --no-print-directory aws-deploy-auth
+	@$(MAKE) --no-print-directory aws-url
+
+aws-deploy-image: ## Deploy an existing ECR IMAGE_TAG to Lambda through CloudFormation, then migrate
+	$(require-aws-credentials)
+	@repo=$$($(call stack-output,$(ECR_STACK),RepositoryUri) | tr -d '[:space:]'); \
+		digest=$$($(AWS) ecr describe-images --repository-name "$${repo#*/}" \
+			--image-ids imageTag=$(IMAGE_TAG) --query 'imageDetails[0].imageDigest' \
+			--output text | tr -d '[:space:]'); \
+		case "$$digest" in ""|None) echo "No ECR image tagged $(IMAGE_TAG)"; exit 1 ;; esac; \
+		image="$$repo@$$digest"; \
+		$(call wait-stack-idle,$(APP_STACK)); \
+		params=$$($(AWS) cloudformation describe-stacks --stack-name $(APP_STACK) \
+			--query 'Stacks[0].Parameters[].ParameterKey' --output text | tr '\t' '\n' | \
+			while IFS= read -r key; do \
+				case "$$key" in \
+					ImageUri) printf 'ParameterKey=ImageUri,ParameterValue=%s ' "$$image" ;; \
+					*) printf 'ParameterKey=%s,UsePreviousValue=true ' "$$key" ;; \
+				esac; \
+			done); \
+		echo "Deploying $$image"; \
+		$(AWS) cloudformation update-stack --stack-name $(APP_STACK) \
+			--use-previous-template --capabilities CAPABILITY_IAM --parameters $$params
+	$(AWS) cloudformation wait stack-update-complete --stack-name $(APP_STACK)
 	@$(MAKE) --no-print-directory aws-migrate
 	@$(MAKE) --no-print-directory aws-url
 
@@ -277,80 +351,18 @@ aws-status: ## Show the stack outputs and the API function's state
 aws-logs: ## Follow the backend function logs
 	$(AWS) logs tail /aws/lambda/$(PROJECT_NAME)-backend --follow
 
-aws-frontend-cert: ## Request and validate the HTTPS certificate for AWS_FRONTEND_DOMAIN (in us-east-1)
-	$(require-aws-credentials)
-	@test -n "$(AWS_FRONTEND_DOMAIN)" || { \
-		echo "AWS_FRONTEND_DOMAIN is empty — set it in .env (e.g. app.example.com)"; exit 1; }
-	@$(CERT) ensure "$(AWS_FRONTEND_DOMAIN)"
-
-aws-deploy-frontend: ## Deploy the frontend to S3 + CloudFront, built against the deployed backend URL
-	$(require-aws-credentials)
-	@api=$$($(call stack-output,$(APP_STACK),ApiUrl) 2>/dev/null | tr -d '[:space:]'); \
-		test -n "$$api" -a "$$api" != "None" || { \
-			echo "No backend API found — run: make aws-deploy-backend"; exit 1; }; \
-		domain=""; \
-		if [ -n "$(AWS_FRONTEND_DOMAIN)" ]; then \
-			cert=$$($(CERT) find "$(AWS_FRONTEND_DOMAIN)"); \
-			test -n "$$cert" || { \
-				echo "No issued us-east-1 certificate for $(AWS_FRONTEND_DOMAIN) — run: make aws-frontend-cert"; \
-				exit 1; }; \
-			zone=$$($(CERT) zone "$(AWS_FRONTEND_DOMAIN)"); \
-			domain="DomainName=$(AWS_FRONTEND_DOMAIN) CertificateArn=$$cert HostedZoneId=$$zone"; \
-			echo "custom domain: $(AWS_FRONTEND_DOMAIN) (Route 53 zone: $${zone:-none})"; \
-		fi; \
-		$(call wait-stack-idle,$(FRONTEND_STACK)); \
-		$(call clear-failed-create,$(FRONTEND_STACK)); \
-		echo "A new CloudFront distribution takes ~5 minutes to come up."; \
-		$(AWS) cloudformation deploy \
-			--stack-name $(FRONTEND_STACK) \
-			--template-file infra/frontend.yml \
-			--no-fail-on-empty-changeset \
-			$(STACK_TAGS) \
-			--parameter-overrides \
-				"ProjectName=$(PROJECT_NAME)" \
-				"PricingPlan=$(or $(AWS_CLOUDFRONT_PLAN),FREE)" \
-				$$domain
-	@# Now that the site's URL exists, let Cognito redirect back to it.
+aws-deploy-frontend: ## Build and deploy the frontend inside the HTTPS Lambda image
+	@$(call wait-stack-idle,$(FRONTEND_STACK)); \
+		$(call clear-failed-create,$(FRONTEND_STACK))
 	@$(MAKE) --no-print-directory aws-deploy-auth
-	@api=$$($(call stack-output,$(APP_STACK),ApiUrl) | tr -d '[:space:]'); \
-		auth=$$($(call stack-outputs,$(AUTH_STACK)) | tr -d '\r'); \
-		auth_out() { printf '%s\n' "$$auth" | awk -F '\t' -v k="$$1" '$$1 == k { print $$2 }'; }; \
-		bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) | tr -d '[:space:]'); \
-		dist=$$($(call stack-output,$(FRONTEND_STACK),DistributionId) | tr -d '[:space:]'); \
-		echo "Building the static export against $$api"; \
-		rm -rf frontend/out; \
-		docker build --target export --output type=local,dest=frontend/out \
-			--build-arg NEXT_PUBLIC_API_BASE_URL="$$api" \
-			--build-arg NEXT_PUBLIC_COGNITO_USER_POOL_ID="$$(auth_out UserPoolId)" \
-			--build-arg NEXT_PUBLIC_COGNITO_CLIENT_ID="$$(auth_out UserPoolClientId)" \
-			--build-arg NEXT_PUBLIC_COGNITO_DOMAIN="$$(auth_out HostedDomain)" \
-			--build-arg NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$(auth_out GoogleEnabled)" \
-			./frontend || exit 1; \
-		echo "Uploading to s3://$$bucket"; \
-		$(AWS) s3 sync frontend/out "s3://$$bucket" --delete --exclude "*.html" \
-			--cache-control "public,max-age=31536000,immutable" --only-show-errors || exit 1; \
-		$(AWS) s3 sync frontend/out "s3://$$bucket" --delete --exclude "*" --include "*.html" \
-			--cache-control "no-cache" --only-show-errors || exit 1; \
-		$(AWS) cloudfront create-invalidation --distribution-id "$$dist" --paths "/*" \
-			--query 'Invalidation.Status' --output text
-	@$(MAKE) --no-print-directory aws-frontend-url
-	@if [ -z "$(AWS_CORS_ORIGINS)" ]; then \
-		allowed=$$($(call stack-output,$(FRONTEND_STACK),AllowedOrigins) | tr -d '[:space:]'); \
-		fn=$$($(call stack-output,$(APP_STACK),FunctionName) | tr -d '[:space:]'); \
-		current=$$($(AWS) lambda get-function-configuration --function-name "$$fn" \
-			--query 'Environment.Variables.CORS_ORIGINS' --output text | tr -d '[:space:]'); \
-		test "$$current" = "$$allowed" || echo "The API still allows CORS_ORIGINS=$$current — run make aws-deploy-backend to limit it to $$allowed"; \
-	fi
-	@if [ -n "$(AWS_FRONTEND_DOMAIN)" ] && [ -z "$$($(CERT) zone "$(AWS_FRONTEND_DOMAIN)")" ]; then \
-		echo "Point $(AWS_FRONTEND_DOMAIN) at the distribution: CNAME $$($(call stack-output,$(FRONTEND_STACK),DistributionDomain) | tr -d '[:space:]')"; \
-	fi
+	@$(MAKE) --no-print-directory aws-deploy-backend
 
 aws-frontend-url: ## Print the deployed site URL
-	@$(call stack-output,$(FRONTEND_STACK),SiteUrl)
+	@$(call stack-output,$(APP_STACK),ApiUrl)
 
 aws-destroy: ## Delete every stack, including the database and its data
 	$(require-aws-credentials)
-	@printf 'Delete %s, %s, %s and %s? The Aurora cluster and all its data, and every user account, go with them (no snapshot). Type yes: ' \
+	@printf 'Delete %s, %s, %s and %s? The database and all its data, and every user account, go with them (no snapshot). Type yes: ' \
 		"$(FRONTEND_STACK)" "$(APP_STACK)" "$(AUTH_STACK)" "$(ECR_STACK)"; \
 		read answer; test "$$answer" = "yes" || { echo "Aborted."; exit 1; }
 	@bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) 2>/dev/null | tr -d '[:space:]'); \

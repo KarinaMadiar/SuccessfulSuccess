@@ -2,14 +2,14 @@ import { RequireAuth } from "@/components/require-auth"
 import { TodayPage } from "@/components/today-page"
 
 export const metadata = {
-  title: "SuccessfulSuccess — Meetings",
-  description: "Today's meetings: who is meeting, when, and what about.",
+  title: "New meeting — SuccessfulSuccess",
 }
 
-export default function Home() {
+/** Same screen as "/", with the create dialog already open. */
+export default function NewMeetingPage() {
   return (
     <RequireAuth>
-      <TodayPage />
+      <TodayPage initialDialogOpen />
     </RequireAuth>
   )
 }

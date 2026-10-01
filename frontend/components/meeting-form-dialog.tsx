@@ -323,3 +323,6 @@ export function MeetingFormDialog({
     </Dialog>
   )
 }
+
+export const CreateMeetingDialog = MeetingFormDialog
+

@@ -1,7 +1,6 @@
-name: Style
+name: CI/CD
 
-# Only on main, as requested. Add `pull_request: branches: [main]` here if you
-# later want the same gates to run before a merge.
+# Pushes to main run the quality gates, then deploy the same commit SHA to Lambda.
 on:
   push:
     branches: [main]
@@ -16,8 +15,24 @@ concurrency:
 
 jobs:
   backend:
-    name: Backend — ruff
+    name: Backend — lint and tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: meetings_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d meetings_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://app:app@localhost:5432/meetings_test
     defaults:
       run:
         working-directory: backend
@@ -27,6 +42,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
+          python-version: "3.12"
           enable-cache: true
           cache-dependency-glob: backend/pyproject.toml
 
@@ -37,6 +53,12 @@ jobs:
 
       - name: Format
         run: uvx ruff@0.16.6 format --diff .
+
+      - name: Install backend dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Test
+        run: uv run pytest -q
 
   frontend:
     name: Frontend — ESLint
@@ -60,3 +82,33 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+  deploy:
+    name: Deploy Lambda image
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      PROJECT_NAME: successfulsuccess
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Sign in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push SHA-tagged image
+        run: make aws-push-image IMAGE_TAG="$IMAGE_TAG"
+
+      - name: Deploy this image to Lambda
+        run: make aws-deploy-image IMAGE_TAG="$IMAGE_TAG"

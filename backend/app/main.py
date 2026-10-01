@@ -1,9 +1,11 @@
 """FastAPI application factory."""
 
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from app.api.v1 import api_router
@@ -13,6 +15,7 @@ from app.errors import error_response, register_exception_handlers
 
 logging.basicConfig(level=settings.log_level.upper())
 logger = logging.getLogger("meetings")
+STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
 
 
 def create_app() -> FastAPI:
@@ -45,6 +48,9 @@ def create_app() -> FastAPI:
                 status.HTTP_503_SERVICE_UNAVAILABLE, "The database is unreachable."
             )
         return {"status": "ok", "database": "ok", "version": settings.version}
+
+    if STATIC_DIR.is_dir():
+        app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="frontend")
 
     return app
 

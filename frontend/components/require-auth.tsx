@@ -1,12 +1,12 @@
 "use client"
 
 import { CalendarDays } from "lucide-react"
-import { useRouter } from "next/navigation"
-import { useEffect } from "react"
 
+import { AuthPage } from "@/components/auth-page"
 import { useAuth } from "@/components/auth-provider"
+import { isAuthConfigured } from "@/lib/auth"
 
-/** Full-screen placeholder while the session is checked or the redirect happens. */
+/** Full-screen placeholder while the session is checked. */
 export function AuthLoading({ label = "Checking your session…" }: { label?: string }) {
   return (
     <div role="status" className="flex flex-1 flex-col items-center justify-center gap-4 py-24">
@@ -25,17 +25,21 @@ export function AuthLoading({ label = "Checking your session…" }: { label?: st
   )
 }
 
-/** Renders its children only for a signed-in user; everyone else goes to the login page. */
+/** Renders its children for a signed-in user; if auth is configured but signed out, shows the login page. */
 export function RequireAuth({ children }: { children: React.ReactNode }) {
   const { status } = useAuth()
-  const router = useRouter()
 
-  useEffect(() => {
-    if (status === "signedOut") router.replace("/")
-  }, [status, router])
-
-  if (status !== "signedIn") {
-    return <AuthLoading label={status === "loading" ? undefined : "Redirecting to sign in…"} />
+  if (!isAuthConfigured) {
+    return <>{children}</>
   }
+
+  if (status === "loading") {
+    return <AuthLoading />
+  }
+
+  if (status === "signedOut") {
+    return <AuthPage />
+  }
+
   return <>{children}</>
 }

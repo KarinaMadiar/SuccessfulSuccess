@@ -24,7 +24,7 @@ export function AppHeader({ onCreate }: { onCreate: () => void }) {
   const meetings = data?.items ?? []
 
   return (
-    <SiteHeader href="/today">
+    <SiteHeader href="/">
       <NavigationMenu className="ml-auto">
         <NavigationMenuList>
           <NavigationMenuItem>

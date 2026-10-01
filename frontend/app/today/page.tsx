@@ -2,11 +2,10 @@ import { RequireAuth } from "@/components/require-auth"
 import { TodayPage } from "@/components/today-page"
 
 export const metadata = {
-  title: "SuccessfulSuccess — Meetings",
-  description: "Today's meetings: who is meeting, when, and what about.",
+  title: "Today — SuccessfulSuccess",
 }
 
-export default function Home() {
+export default function Today() {
   return (
     <RequireAuth>
       <TodayPage />
