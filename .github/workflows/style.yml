@@ -97,6 +97,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Verify AWS role variable
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::Set the repository Actions variable AWS_ROLE_ARN to the role ARN printed by .\\make aws-github-actions-role-arn."
+            exit 1
+          fi
+
       - name: Configure AWS credentials through OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
