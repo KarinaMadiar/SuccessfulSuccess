@@ -367,6 +367,4 @@ There is no deploy (CD) stage — no target is configured yet.
 - The backend bind-mounts `./backend`, so `uvicorn --reload` picks up edits live.
 - The frontend runs `next dev` in the container with the same bind mount.
 - Backend tests run against a real Postgres (`meetings_test`), truncating tables
-  between tests; `make test` creates that database if it is missing.
-
-  
+  between tests; `make test` creates that database if it is missing
