@@ -67,6 +67,9 @@ Resources:
       # before real traffic arrives.
       EmailConfiguration:
         EmailSendingAccount: COGNITO_DEFAULT
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      UserPoolTier: ESSENTIALS
       UserPoolTags:
         PROJECT_NAME: !Ref ProjectName
 
@@ -78,6 +81,7 @@ Resources:
       UserPoolId: !Ref UserPool
       # Domain prefixes are unique per region across all accounts.
       Domain: !Sub "${ProjectName}-${AWS::AccountId}"
+      ManagedLoginVersion: 2
 
   GoogleIdentityProvider:
     Type: AWS::Cognito::UserPoolIdentityProvider
@@ -126,6 +130,13 @@ Resources:
       AllowedOAuthScopes: [openid, email, profile]
       CallbackURLs: !Ref AppUrls
       LogoutURLs: !Ref AppUrls
+
+  ManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientId: !Ref UserPoolClient
+      UseCognitoProvidedValues: true
 
 Outputs:
   UserPoolId:

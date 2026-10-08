@@ -5,6 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
@@ -16,6 +17,18 @@ from app.errors import error_response, register_exception_handlers
 logging.basicConfig(level=settings.log_level.upper())
 logger = logging.getLogger("meetings")
 STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
+
+
+class CleanStaticFiles(StaticFiles):
+    """Serve directory/index.html directly without 307 redirect loops under Mangum/Lambda."""
+
+    async def get_response(self, path: str, scope) -> Response:
+        if self.directory:
+            clean = path.strip("/")
+            dir_index = Path(self.directory) / clean / "index.html"
+            if dir_index.is_file():
+                return FileResponse(dir_index)
+        return await super().get_response(path, scope)
 
 
 def create_app() -> FastAPI:
@@ -50,7 +63,7 @@ def create_app() -> FastAPI:
         return {"status": "ok", "database": "ok", "version": settings.version}
 
     if STATIC_DIR.is_dir():
-        app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="frontend")
+        app.mount("/", CleanStaticFiles(directory=STATIC_DIR, html=True), name="frontend")
 
     return app
 

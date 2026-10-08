@@ -52,13 +52,16 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-auth/*"
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-ecr/*"
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-backend/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-cloudfront/*"
               - Sid: UpdateBackendStack
                 Effect: Allow
                 Action:
                   - cloudformation:UpdateStack
                   - cloudformation:DescribeStacks
                   - cloudformation:DescribeStackEvents
-                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-backend/*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-backend/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-cloudfront/*"
               - Sid: ReadLambdaVpcConfiguration
                 Effect: Allow
                 Action:

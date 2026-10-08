@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CloudFront distribution for SuccessfulSuccess: accelerates static assets,
+  provides global CDN caching, and routes API requests to the Lambda function URL.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: successfulsuccess
+    Description: Prefix for the names of the resources in this stack.
+
+  OriginDomain:
+    Type: String
+    Description: >-
+      The domain name of the Lambda function URL origin (e.g.
+      <id>.lambda-url.<region>.on.aws), without the https:// prefix or trailing slash.
+
+  DomainName:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional custom domain name (e.g. meetings.example.com). Requires CertificateArn.
+      Leave empty to use the default *.cloudfront.net domain.
+
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ACM certificate ARN for DomainName, issued in us-east-1. Required if DomainName is set.
+
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional Route 53 Hosted Zone ID for DomainName. If set, an alias record is created.
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, ""]]
+  HasRoute53Zone: !And
+    - !Condition HasCustomDomain
+    - !Not [!Equals [!Ref HostedZoneId, ""]]
+
+Resources:
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${ProjectName} CDN and reverse proxy"
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100 # North America and Europe edge locations (lowest cost)
+        Aliases: !If [HasCustomDomain, [!Ref DomainName], !Ref "AWS::NoValue"]
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: LambdaBackendOrigin
+            DomainName: !Ref OriginDomain
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginKeepaliveTimeout: 5
+              OriginReadTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: LambdaBackendOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          # Managed-CachingDisabled: passes HTML requests dynamically through to Lambda
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed-AllViewerExceptHostHeader: preserves original Authorization, cookies, query string, while sending origin Host
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CacheBehaviors:
+          # Cache Next.js immutable static build assets
+          - PathPattern: "/_next/static/*"
+            TargetOriginId: LambdaBackendOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            # Managed-CachingOptimized
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            # Managed-AllViewerExceptHostHeader
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+          # Cache static public files
+          - PathPattern: "/static/*"
+            TargetOriginId: LambdaBackendOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            # Managed-CachingOptimized
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+          # Pass API requests directly to Lambda
+          - PathPattern: "/api/*"
+            TargetOriginId: LambdaBackendOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - POST
+              - PATCH
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            # Managed-CachingDisabled
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # Managed-AllViewerExceptHostHeader
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+          # Pass health checks directly to Lambda
+          - PathPattern: "/health"
+            TargetOriginId: LambdaBackendOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            # Managed-CachingDisabled
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+          # Pass Swagger / OpenAPI docs directly to Lambda
+          - PathPattern: "/docs*"
+            TargetOriginId: LambdaBackendOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            # Managed-CachingDisabled
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+          - PathPattern: "/openapi.json"
+            TargetOriginId: LambdaBackendOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            # Managed-CachingDisabled
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  AliasRecordIPv4:
+    Type: AWS::Route53::RecordSet
+    Condition: HasRoute53Zone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # Global CloudFront Zone ID
+
+  AliasRecordIPv6:
+    Type: AWS::Route53::RecordSet
+    Condition: HasRoute53Zone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # Global CloudFront Zone ID
+
+Outputs:
+  DistributionId:
+    Description: CloudFront Distribution ID
+    Value: !Ref Distribution
+
+  DistributionDomain:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt Distribution.DomainName
+
+  SiteUrl:
+    Description: Primary site URL
+    Value: !If
+      - HasCustomDomain
+      - !Sub "https://${DomainName}"
+      - !Sub "https://${Distribution.DomainName}"

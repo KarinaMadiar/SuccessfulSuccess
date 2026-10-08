@@ -39,6 +39,10 @@ AUTH_STACK ?= $(PROJECT_NAME)-auth
 APP_STACK ?= $(PROJECT_NAME)-backend
 ECR_STACK ?= $(PROJECT_NAME)-ecr
 FRONTEND_STACK ?= $(PROJECT_NAME)-frontend
+CLOUDFRONT_STACK ?= $(PROJECT_NAME)-cloudfront
+CLOUDFRONT_DOMAIN ?=
+CLOUDFRONT_CERT_ARN ?=
+CLOUDFRONT_ZONE_ID ?=
 IMAGE_TAG ?= latest
 # x86_64 or arm64. arm64 is ~20% cheaper on Lambda and builds natively on
 # Apple Silicon; the image platform is derived from it so the two cannot drift.
@@ -94,7 +98,7 @@ endef
 	deploy-backend deploy-frontend \
 	aws-whoami aws-deploy aws-deploy-auth aws-auth-env aws-ecr aws-push aws-push-image aws-deploy-backend aws-deploy-image aws-migrate aws-url aws-status aws-logs \
 	aws-github-oidc-provider aws-deploy-github-actions aws-github-actions-role-arn \
-		aws-deploy-frontend aws-frontend-url aws-destroy
+	aws-deploy-frontend aws-frontend-url aws-deploy-cloudfront aws-cloudfront-url aws-check-quota aws-destroy
 
 help:
 	@grep -hE '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -197,6 +201,8 @@ aws-deploy-auth: ## Create/update the Cognito user pool (email + password; Googl
 	@urls="http://localhost:$(or $(FRONTEND_PORT),3000)/"; \
 		site=$$($(call stack-output,$(APP_STACK),ApiUrl) 2>/dev/null | tr -d '[:space:]'); \
 		case "$$site" in ""|None) ;; *) urls="$$urls,$$site/" ;; esac; \
+		cf_site=$$($(call stack-output,$(CLOUDFRONT_STACK),SiteUrl) 2>/dev/null | tr -d '[:space:]'); \
+		case "$$cf_site" in ""|None) ;; *) urls="$$urls,$$cf_site/" ;; esac; \
 		echo "Sign-in redirect URLs: $$urls"; \
 		test -n "$(GOOGLE_CLIENT_ID)" || echo "GOOGLE_CLIENT_ID is empty — Google sign-in stays off"; \
 		$(call wait-stack-idle,$(AUTH_STACK)); \
@@ -360,11 +366,47 @@ aws-deploy-frontend: ## Build and deploy the frontend inside the HTTPS Lambda im
 aws-frontend-url: ## Print the deployed site URL
 	@$(call stack-output,$(APP_STACK),ApiUrl)
 
+aws-deploy-cloudfront: ## Deploy CloudFront CDN in front of the Lambda backend and update Cognito
+	$(require-aws-credentials)
+	@origin=$$($(call stack-output,$(APP_STACK),FunctionUrlDomain) 2>/dev/null | tr -d '[:space:]'); \
+		case "$$origin" in ""|None) echo "No backend found — run: make aws-deploy-backend first"; exit 1 ;; esac; \
+		echo "Deploying CloudFront distribution in front of $$origin..."; \
+		$(call wait-stack-idle,$(CLOUDFRONT_STACK)); \
+		$(call clear-failed-create,$(CLOUDFRONT_STACK)); \
+		$(AWS) cloudformation deploy \
+			--stack-name $(CLOUDFRONT_STACK) \
+			--template-file infra/cloudfront.yml \
+			--no-fail-on-empty-changeset \
+			$(STACK_TAGS) \
+			--parameter-overrides \
+				"ProjectName=$(PROJECT_NAME)" \
+				"OriginDomain=$$origin" \
+				"DomainName=$(CLOUDFRONT_DOMAIN)" \
+				"CertificateArn=$(CLOUDFRONT_CERT_ARN)" \
+				"HostedZoneId=$(CLOUDFRONT_ZONE_ID)"
+	@cf_url=$$($(call stack-output,$(CLOUDFRONT_STACK),SiteUrl) | tr -d '[:space:]'); \
+		echo "CloudFront deployed at: $$cf_url"; \
+		echo "Updating Cognito redirect URLs..."; \
+		$(MAKE) --no-print-directory aws-deploy-auth
+	@$(MAKE) --no-print-directory aws-cloudfront-url
+
+aws-cloudfront-url: ## Print the deployed CloudFront site URL
+	@$(call stack-output,$(CLOUDFRONT_STACK),SiteUrl)
+
+aws-check-quota: ## Check status of the CloudFront quota/verification review
+	$(require-aws-credentials)
+	@$(AWS) service-quotas get-requested-service-quota-change \
+		--request-id "307e4f1fb32a4093b5fc474b27015a58pXSiuGcQ" \
+		--query 'RequestedQuota.{Status:Status,Created:Created,LastUpdated:LastUpdated,Quota:QuotaName}' \
+		--output table
+
 aws-destroy: ## Delete every stack, including the database and its data
 	$(require-aws-credentials)
-	@printf 'Delete %s, %s, %s and %s? The database and all its data, and every user account, go with them (no snapshot). Type yes: ' \
-		"$(FRONTEND_STACK)" "$(APP_STACK)" "$(AUTH_STACK)" "$(ECR_STACK)"; \
+	@printf 'Delete %s, %s, %s, %s and %s? The database and all its data, and every user account, go with them (no snapshot). Type yes: ' \
+		"$(CLOUDFRONT_STACK)" "$(FRONTEND_STACK)" "$(APP_STACK)" "$(AUTH_STACK)" "$(ECR_STACK)"; \
 		read answer; test "$$answer" = "yes" || { echo "Aborted."; exit 1; }
+	-$(AWS) cloudformation delete-stack --stack-name $(CLOUDFRONT_STACK)
+	-$(AWS) cloudformation wait stack-delete-complete --stack-name $(CLOUDFRONT_STACK)
 	@bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) 2>/dev/null | tr -d '[:space:]'); \
 		if [ -n "$$bucket" ] && [ "$$bucket" != "None" ]; then \
 			echo "Emptying s3://$$bucket"; \

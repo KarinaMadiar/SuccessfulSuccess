@@ -262,8 +262,20 @@ make aws-frontend-url      # print the shared site/API URL
 The Next.js **static export** is built with Cognito settings and bundled into the
 Lambda container image. FastAPI serves route `index.html` files, JavaScript,
 styles, and images alongside `/api/v1`, all from the same HTTPS function URL.
-This avoids CloudFront account verification and separate production CORS
-configuration. Function URLs do not support custom domains.
+Function URLs do not support custom domains natively.
+
+### 3. CloudFront CDN (optional)
+
+```bash
+make aws-deploy-cloudfront   # deploy CloudFront in front of the Lambda backend and update Cognito
+make aws-cloudfront-url      # print the https://<id>.cloudfront.net URL
+```
+
+`infra/cloudfront.yml` provisions a CloudFront distribution that sits in front of the
+Lambda function URL. It caches static assets (`/_next/static/*`, `/static/*`) at global
+edge locations, passes API requests directly through with authentication preserved, and
+automatically updates Cognito's redirect URLs with the CloudFront domain. Custom domains
+are supported via `CLOUDFRONT_DOMAIN` and `CLOUDFRONT_CERT_ARN`.
 
 ### Cost
 
