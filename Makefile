@@ -40,6 +40,9 @@ APP_STACK ?= $(PROJECT_NAME)-backend
 ECR_STACK ?= $(PROJECT_NAME)-ecr
 FRONTEND_STACK ?= $(PROJECT_NAME)-frontend
 CLOUDFRONT_STACK ?= $(PROJECT_NAME)-cloudfront
+REPORTS_STACK ?= $(PROJECT_NAME)-reports
+REPORTS_SENDER ?= reports@$(or $(CLOUDFRONT_DOMAIN),successful.pp.ua)
+REPORTS_RECIPIENT ?= madiar.pn@ucu.edu.ua
 CLOUDFRONT_DOMAIN ?=
 CLOUDFRONT_CERT_ARN ?=
 CLOUDFRONT_ZONE_ID ?=
@@ -98,7 +101,8 @@ endef
 	deploy-backend deploy-frontend \
 	aws-whoami aws-deploy aws-deploy-auth aws-auth-env aws-ecr aws-push aws-push-image aws-deploy-backend aws-deploy-image aws-migrate aws-url aws-status aws-logs \
 	aws-github-oidc-provider aws-deploy-github-actions aws-github-actions-role-arn \
-	aws-deploy-frontend aws-frontend-url aws-deploy-cloudfront aws-cloudfront-url aws-check-quota aws-destroy
+	aws-deploy-frontend aws-frontend-url aws-deploy-cloudfront aws-cloudfront-url aws-check-quota \
+	aws-deploy-reports report-now report-schedule-test report-dlq-test report-dlq-redrive report-s3-ls report-logs-builder report-logs-mailer aws-destroy
 
 help:
 	@grep -hE '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -399,6 +403,112 @@ aws-check-quota: ## Check status of the CloudFront quota/verification review
 		--request-id "307e4f1fb32a4093b5fc474b27015a58pXSiuGcQ" \
 		--query 'RequestedQuota.{Status:Status,Created:Created,LastUpdated:LastUpdated,Quota:QuotaName}' \
 		--output table
+
+aws-ses-identities: ## List SES email identities
+	$(require-aws-credentials)
+	@$(AWS) sesv2 list-email-identities
+
+aws-route53-zones: ## List Route53 hosted zones
+	$(require-aws-credentials)
+	@$(AWS) route53 list-hosted-zones
+
+
+
+aws-cmd: ## Run arbitrary AWS command: make aws-cmd CMD="s3 ls"
+	$(require-aws-credentials)
+	@$(AWS) $(CMD)
+
+aws-deploy-reports: aws-push ## Deploy the weekly reports event-driven stack (Scheduler, SQS, Lambdas, S3, SES)
+	$(require-aws-credentials)
+	$(require-db-password)
+	@repo=$$($(call stack-output,$(ECR_STACK),RepositoryUri) | tr -d '[:space:]'); \
+		digest=$$($(AWS) ecr describe-images --repository-name "$${repo#*/}" \
+			--image-ids imageTag=$(IMAGE_TAG) --query 'imageDetails[0].imageDigest' \
+			--output text | tr -d '[:space:]'); \
+		case "$$digest" in ""|None) echo "No ECR image tagged $(IMAGE_TAG)"; exit 1 ;; esac; \
+		image="$$repo@$$digest"; \
+		vpc=$$($(AWS) ec2 describe-vpcs --filters Name=isDefault,Values=true \
+			--query 'Vpcs[0].VpcId' --output text | tr -d '[:space:]'); \
+		subnets=$$($(AWS) ec2 describe-subnets \
+			--filters Name=vpc-id,Values=$$vpc Name=default-for-az,Values=true \
+			--query 'Subnets[].SubnetId' --output text | tr '[:space:]' ',' | sed 's/,*$$//'); \
+		rtb=$$($(AWS) ec2 describe-route-tables --filters Name=vpc-id,Values=$$vpc \
+			--query 'RouteTables[0].RouteTableId' --output text | tr -d '[:space:]'); \
+		sg=$$($(AWS) lambda get-function-configuration --function-name $(PROJECT_NAME)-backend \
+			--query 'VpcConfig.SecurityGroupIds[0]' --output text | tr -d '[:space:]'); \
+		db_url=$$($(AWS) lambda get-function-configuration --function-name $(PROJECT_NAME)-backend \
+			--query 'Environment.Variables.DATABASE_URL' --output text | tr -d '[:space:]'); \
+		echo "Deploying reports stack (VPC: $$vpc, RTB: $$rtb, SG: $$sg)..."; \
+		$(call wait-stack-idle,$(REPORTS_STACK)); \
+		$(call clear-failed-create,$(REPORTS_STACK)); \
+		$(AWS) cloudformation deploy \
+			--stack-name $(REPORTS_STACK) \
+			--template-file infra/reports.yml \
+			--capabilities CAPABILITY_IAM \
+			--no-fail-on-empty-changeset \
+			$(STACK_TAGS) \
+			--parameter-overrides \
+				"ProjectName=$(PROJECT_NAME)" \
+				"VpcId=$$vpc" \
+				"SubnetIds=$$subnets" \
+				"SecurityGroupId=$$sg" \
+				"RouteTableId=$$rtb" \
+				"DatabaseUrl=$$db_url" \
+				"ImageUri=$$image" \
+				"AppTimezone=$(APP_TIMEZONE)" \
+				"DomainName=$(or $(CLOUDFRONT_DOMAIN),successful.pp.ua)" \
+				"SenderEmail=$(REPORTS_SENDER)" \
+				"RecipientEmail=$(REPORTS_RECIPIENT)"
+	@echo "Reports stack deployed successfully."
+	@$(AWS) cloudformation describe-stacks --stack-name $(REPORTS_STACK) \
+		--query 'Stacks[0].Outputs' --output table
+
+report-now: ## Request an on-demand report generation via SQS: make report-now WEEK=2026-W39
+	$(require-aws-credentials)
+	@queue=$$($(call stack-output,$(REPORTS_STACK),QueueUrl) | tr -d '[:space:]'); \
+		case "$$queue" in ""|None) echo "Reports stack not deployed yet — run make aws-deploy-reports"; exit 1 ;; esac; \
+		week="$(WEEK)"; \
+		test -n "$$week" || week=$$(python -c "import datetime; d=datetime.date.today()-datetime.timedelta(days=7); y,w,_=d.isocalendar(); print(f'{y}-W{w:02d}')"); \
+		echo "Sending on-demand report request for $$week to SQS $$queue..."; \
+		$(AWS) sqs send-message --queue-url "$$queue" \
+			--message-body "{\"week\": \"$$week\", \"source\": \"sqs\"}"
+	@echo "On-demand request sent. Check logs with make report-logs-builder and make report-logs-mailer"
+
+report-schedule-test: ## Trigger report generation using schedule payload: make report-schedule-test
+	$(require-aws-credentials)
+	@queue=$$($(call stack-output,$(REPORTS_STACK),QueueUrl) | tr -d '[:space:]'); \
+		case "$$queue" in ""|None) echo "Reports stack not deployed yet — run make aws-deploy-reports"; exit 1 ;; esac; \
+		echo "Triggering schedule test on $$queue..."; \
+		$(AWS) sqs send-message --queue-url "$$queue" \
+			--message-body '{"week": null, "source": "schedule"}'
+
+report-dlq-test: ## Test DLQ by sending a failing week (re-tries 3 times, moves to DLQ)
+	$(require-aws-credentials)
+	@queue=$$($(call stack-output,$(REPORTS_STACK),QueueUrl) | tr -d '[:space:]'); \
+		case "$$queue" in ""|None) echo "Reports stack not deployed yet — run make aws-deploy-reports"; exit 1 ;; esac; \
+		echo "Sending poison pill message to trigger DLQ..."; \
+		$(AWS) sqs send-message --queue-url "$$queue" \
+			--message-body '{"week": "FAIL", "source": "sqs"}'
+
+report-dlq-redrive: ## Start redrive of messages from DLQ back to primary queue
+	$(require-aws-credentials)
+	@dlq_arn=$$($(call stack-output,$(REPORTS_STACK),DlqArn) | tr -d '[:space:]'); \
+		echo "Starting DLQ redrive from $$dlq_arn..."; \
+		$(AWS) sqs start-message-move-task --source-arn "$$dlq_arn"
+
+report-s3-ls: ## List generated reports in S3 bucket
+	$(require-aws-credentials)
+	@bucket=$$($(call stack-output,$(REPORTS_STACK),ReportsBucketName) | tr -d '[:space:]'); \
+		echo "Reports in s3://$$bucket/reports/:"; \
+		$(AWS) s3 ls "s3://$$bucket/reports/" --recursive
+
+report-logs-builder: ## View logs of the report-builder Lambda
+	$(require-aws-credentials)
+	$(AWS) logs tail /aws/lambda/$(PROJECT_NAME)-report-builder --since 15m
+
+report-logs-mailer: ## View logs of the report-mailer Lambda
+	$(require-aws-credentials)
+	$(AWS) logs tail /aws/lambda/$(PROJECT_NAME)-report-mailer --since 15m
 
 aws-destroy: ## Delete every stack, including the database and its data
 	$(require-aws-credentials)

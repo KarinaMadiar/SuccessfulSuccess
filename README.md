@@ -385,3 +385,157 @@ There is no deploy (CD) stage — no target is configured yet.
 - The frontend runs `next dev` in the container with the same bind mount.
 - Backend tests run against a real Postgres (`meetings_test`), truncating tables
   between tests; `make test` creates that database if it is missing
+
+---
+
+## Module 5: Event-Driven Architecture — Weekly Reports
+
+A decoupled, event-driven pipeline that computes weekly meetings insights, saves CSV reports to S3, and delivers them via Amazon SES with zero synchronous blocking.
+
+### Architecture
+
+```
+                                  [EventBridge Scheduler]
+                                   cron(0 7 ? * MON *)
+                                            │
+               make report-now              │ (command)
+             (on-demand trigger)            ▼
+                      │              [ SQS Queue ] ──(after 3 fails)──→ [ SQS DLQ ]
+                      └─────────────► report-requests                   report-requests-dlq
+                                            │
+                                            │ EventSourceMapping (batchSize=1)
+                                            ▼
+                               [ Lambda: report-builder ]  (VPC, no NAT)
+                                      │         │
+                   queries PostgreSQL │         │ writes CSV via Gateway VPCEndpoint
+                                      ▼         ▼
+                                 [ RDS DB ]   [ S3 Bucket ]
+                                              reports/*.csv
+                                                    │
+                                                    │ s3:ObjectCreated:* (event)
+                                                    ▼
+                                  [ Lambda: report-mailer ] (outside VPC, public internet)
+                                                    │
+                                                    │ sesv2:send_email (MIME with attachment)
+                                                    ▼
+                                              [ Amazon SES ] ──→ Recipient Inbox
+```
+
+### Key Components
+
+1. **EventBridge Scheduler (`WeeklyReportSchedule`)**:
+   Runs every Monday at 07:00 (`Europe/Kyiv` timezone), dispatching a command message `{"week": null, "source": "schedule"}` to SQS.
+2. **Amazon SQS (`ReportRequestsQueue` + `ReportRequestsDlq`)**:
+   Buffers requests with `VisibilityTimeout = 360s` (6x builder timeout). Failed messages retry up to 3 times before dead-lettering into the DLQ.
+3. **Builder Lambda (`successfulsuccess-report-builder`)**:
+   Runs in the private VPC with access to PostgreSQL. Resolves target week (or defaults to previous ISO week), aggregates insights (total meetings, duration, week-over-week deltas, top 5 longest meetings, and organiser/participant breakdowns), and writes the CSV to `s3://<bucket>/reports/<week>.csv` via the free S3 Gateway VPC Endpoint.
+4. **Mailer Lambda (`successfulsuccess-report-mailer`)**:
+   Triggered asynchronously by S3 `s3:ObjectCreated:*` notifications. Runs outside the VPC, downloads the CSV, builds a multipart MIME message with Python `email.message.EmailMessage`, and transmits it via Amazon SES (`sesv2.send_email`).
+5. **Amazon SES**:
+   Domain identity (`successful.pp.ua`) with Easy DKIM CNAME records, plus verified recipient address (`madiar.pn@ucu.edu.ua`).
+
+### Report Commands
+
+```bash
+make aws-deploy-reports       # Deploy infra/reports.yml stack (S3, SQS, Lambdas, Schedule, SES)
+make report-now WEEK=2026-W41 # Request on-demand report generation via SQS
+make report-schedule-test     # Trigger builder using schedule message payload
+make report-dlq-test          # Test DLQ routing with poison pill payload
+make report-dlq-redrive       # Redrive failed messages from DLQ back to primary queue
+make report-s3-ls             # List generated reports in S3 bucket
+make report-logs-builder      # Tail CloudWatch logs of builder Lambda
+make report-logs-mailer       # Tail CloudWatch logs of mailer Lambda
+```
+
+---
+
+## Lab 5 Submission Deliverables & Written Answers
+
+### 1. Link to Commit
+Commit adding report logic (`app/reports/weekly.py`), builder handler (`app/reports/lambda_handler.py`), mailer handler (`app/reports/mailer.py`), CloudFormation template (`infra/reports.yml`), test suites, and Makefile targets.
+
+### 2. S3 Reports Listing (`aws s3 ls`)
+```text
+Reports in s3://successfulsuccess-reports-584503398119/reports/:
+2026-10-15 17:52:14        692 reports/2026-W40.csv
+2026-10-15 17:51:46        635 reports/2026-W41.csv
+```
+- `reports/2026-W41.csv`: Generated automatically by schedule trigger.
+- `reports/2026-W40.csv`: Generated on-demand via `make report-now WEEK=2026-W40`.
+
+### 3. CloudWatch Log Lines (One per Trigger)
+
+- **Schedule Trigger (Builder)**:
+  ```text
+  [INFO] 2026-10-15T17:51:45.061Z 544d8a9c-b53a-5c75-8e97-e9d7a1d028eb report-builder triggered: trigger=schedule week=2026-W41
+  ```
+- **SQS Message Trigger (Builder)**:
+  ```text
+  [INFO] 2026-10-15T17:50:39.492Z 87ee5a1a-47c5-5234-afd1-3951535f77c2 report-builder triggered: trigger=sqs week=2026-W41
+  ```
+- **S3 Upload Trigger (Mailer)**:
+  ```text
+  [INFO] 2026-10-15T17:50:41.376Z fb092d82-5c75-49e5-a5f9-a04972b1ba2d report-mailer triggered: trigger=s3 bucket=successfulsuccess-reports-584503398119 key=reports/2026-W41.csv
+  ```
+
+---
+
+### Part 3, Step 7 Written Answers
+
+#### Question 1: Handling Duplicate S3 ObjectCreated Events & Idempotency
+**Question**: *The mailer got the same ObjectCreated event twice, and the person got two identical emails. Where would you store "this report was already sent", and what would the key be?*
+
+**Answer**:
+To make the mailer idempotent and prevent duplicate email dispatch when an S3 file is overwritten or when S3 delivers an `ObjectCreated` event more than once:
+- **Storage**: Store the deduplication state in **Amazon DynamoDB** (or Redis / a lightweight state table) with atomic conditional writes (`attribute_not_exists(pk)`).
+- **Key**: The partition key would be `report_sent#<bucket>#<key>#<object_eTag_or_versionId>` (or simply `report_sent#reports/<week>.csv` if only one email per week is permitted).
+- **Behavior**: Before dispatching via SES, the mailer executes `PutItem` with `ConditionExpression="attribute_not_exists(pk)"`. If the key already exists, the write fails with `ConditionalCheckFailedException`, allowing the mailer to log `"Duplicate event ignored: report already sent"` and exit cleanly without sending a duplicate email. A TTL (e.g., 30 days) can be attached to automatically clean up old deduplication keys.
+
+---
+
+#### Question 2: VPC Lambda SES Connectivity & Cost Tradeoffs
+**Question**: *The builder in the VPC could not reach SES. List three ways to fix that, with their monthly cost: a NAT gateway, a VPC interface endpoint for SES, and the split you built. Which would you choose with ten more emails a week? With a million?*
+
+**Answer**:
+1. **NAT Gateway**:
+   - *Cost*: ~$0.045/hour (~$32.40/month per AZ) + $0.045/GB data processed + Elastic IP cost (~$3.65/mo) = **~$36.00/month**.
+2. **VPC Interface Endpoint (AWS PrivateLink for SES)**:
+   - *Cost*: ~$0.01/hour per AZ (~$7.20/month for single AZ, or ~$14.40/month for 2 AZs) + $0.01/GB data processed = **~$7.20 - $14.40/month**.
+3. **The Split Built in Lab 5 (Two Lambdas connected via S3 & Gateway Endpoint)**:
+   - *Cost*: S3 Gateway VPC Endpoint is **$0.00 (free)**. S3 storage and Lambda invocations at low volume fall well within the AWS Free Tier, costing **$0.00/month**.
+- **Choice with 10 more emails a week**:
+  The **Split architecture built in this lab ($0.00/mo)**. Paying $14 to $36/month for 10 emails is a waste of cloud budget.
+- **Choice with a million emails a week**:
+  The **VPC Interface Endpoint (~$14.40/mo + SES charges)** if synchronous transactional emails from backend handlers are required; or continue using the **Split / SQS architecture** if emails are batch/event-driven reports, because SQS and S3 easily absorb massive surges with built-in retries, backpressure, and zero NAT gateway bottlenecks.
+
+---
+
+#### Question 3: Long-Lived Download Links vs Presigned URL Expiration
+**Question**: *You could send a presigned S3 link instead of an attachment. A presigned URL signed with a Lambda role's temporary credentials stops working when those credentials expire, often within hours. How would you send a link that works for a week?*
+
+**Answer**:
+Temporary STS credentials issued to Lambda execution roles expire within 15 minutes to 12 hours; any presigned URL created using those credentials becomes invalid as soon as the temporary credentials expire, regardless of the `ExpiresIn=604800` parameter.
+To send a download link valid for a full week (7 days):
+1. **CloudFront Signed URLs**: Distribute the private S3 bucket through CloudFront using Origin Access Control (OAC). Sign the URL using CloudFront's RSA private key (managed via CloudFront Key Groups). CloudFront signed URLs are evaluated at CloudFront edge caches and can remain valid for days, weeks, or months without STS credential expiration limits.
+2. **Sign with Long-Lived IAM Credentials**: Use an IAM User with restrictive S3 read permissions whose credentials do not expire, stored securely in AWS Secrets Manager or Parameter Store. SigV4 URLs generated with permanent IAM user credentials can have a maximum validity of 7 days (604,800 seconds).
+3. **Application Download Endpoint**: Send a permanent application link (e.g. `https://successful.pp.ua/api/v1/reports/2026-W41`). When the user clicks it, the authenticated backend generates a short-lived (e.g. 5-minute) redirect to S3 on the fly.
+
+---
+
+### Class Discussion Guide
+
+1. **Commands vs Events**:
+   - In the cake shop: An *order slip* ("Bake Napoleon, 8 portions") is a **command** directed at the bakers. A *cake placed on the shelf* is an **event** ("CakeBaked").
+   - In Lab 5: EventBridge Scheduler putting `{"week": null, "source": "schedule"}` onto SQS is a **command** (telling the builder to run). The S3 PutObject resulting in `s3:ObjectCreated` is an **event** (a past fact). The builder does not know the mailer exists.
+2. **Idempotency**:
+   - Writing `reports/2026-W40.csv` to S3 is **idempotent**: running it ten times overwrites the exact same file and leaves one CSV.
+   - Sending an email via SES is **not idempotent**: calling SES ten times sends ten distinct emails to the recipient's inbox.
+3. **Eventual Consistency**:
+   - If a meeting is edited at 07:01, the 07:00 report reflects the database state at snapshot execution time. This is standard eventual consistency for analytical reporting.
+4. **Adding Slack Notifications**:
+   - To add a Slack notification when a report is ready, change **nothing** in the builder Lambda. Simply subscribe a new Lambda function to the same S3 `s3:ObjectCreated:*` event (or route S3 events via EventBridge/SNS to multiple subscribers).
+5. **Redis vs RabbitMQ**:
+   - For financial payments where losing a message is catastrophic, **RabbitMQ** (or SQS) is preferred over Redis because RabbitMQ supports explicit consumer ACKs, durable disk queues, and dead-letter exchanges out of the box, whereas standard Redis list pops remove messages immediately upon retrieval.
+6. **SQS Visibility Timeout vs Lambda Timeout**:
+   - The SQS visibility timeout must exceed the function timeout (recommended >= 6x). If visibility timeout were shorter than function execution time, SQS would assume the first worker died and re-deliver the message to a second worker while the first is still processing, causing duplicate concurrent execution.
+
