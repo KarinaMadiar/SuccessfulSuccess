@@ -607,7 +607,7 @@ make aws-logs-parser                    # Tail CloudWatch logs of agenda-parser 
 ### 1. Link to Commit & Artifacts
 - **Parser function**: `backend/app/ai/agenda.py`
 - **Lambda handler**: `backend/app/ai/agenda_lambda.py`
-- **Infrastructure template**: `infra/ai.yml`
+- **Infrastructure template**: `infra/ai.yml` (deployed stack: `successfulsuccess-ai`, Function URL: `https://zsiohlapuuwtxcz7hr6xgz3kmm0cynqf.lambda-url.us-east-1.on.aws/`)
 - **Frontend screen**: `frontend/components/meeting-form-dialog.tsx`, `frontend/lib/api.ts`, `frontend/lib/types.ts`
 - **Database migration**: `backend/alembic/versions/0003_add_ai_suggestion_to_meetings.py`
 - **Architecture Decision Record**: `docs/adr/0006-llm-agenda-parsing.md`
