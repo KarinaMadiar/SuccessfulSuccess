@@ -20,7 +20,8 @@ endif
 -include .env
 # Every stack (Cognito, ECR, Lambda and RDS) is created in this one region.
 AWS_REGION ?= us-east-1
-export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION PROJECT_NAME
+PARSER_MODEL ?= anthropic.claude-opus-5-5
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION PROJECT_NAME PARSER_MODEL
 # On Windows, stop Git's bash rewriting container paths such as /aws or
 # /dev/null into C:/Program Files/Git/... before docker sees them.
 export MSYS_NO_PATHCONV := 1
@@ -41,6 +42,7 @@ ECR_STACK ?= $(PROJECT_NAME)-ecr
 FRONTEND_STACK ?= $(PROJECT_NAME)-frontend
 CLOUDFRONT_STACK ?= $(PROJECT_NAME)-cloudfront
 REPORTS_STACK ?= $(PROJECT_NAME)-reports
+AI_STACK ?= $(PROJECT_NAME)-ai
 REPORTS_SENDER ?= reports@$(or $(CLOUDFRONT_DOMAIN),successful.pp.ua)
 REPORTS_RECIPIENT ?= madiar.pn@ucu.edu.ua
 CLOUDFRONT_DOMAIN ?=
@@ -102,7 +104,8 @@ endef
 	aws-whoami aws-deploy aws-deploy-auth aws-auth-env aws-ecr aws-push aws-push-image aws-deploy-backend aws-deploy-image aws-migrate aws-url aws-status aws-logs \
 	aws-github-oidc-provider aws-deploy-github-actions aws-github-actions-role-arn \
 	aws-deploy-frontend aws-frontend-url aws-deploy-cloudfront aws-cloudfront-url aws-check-quota \
-	aws-deploy-reports report-now report-schedule-test report-dlq-test report-dlq-redrive report-s3-ls report-logs-builder report-logs-mailer aws-destroy
+	aws-deploy-reports report-now report-schedule-test report-dlq-test report-dlq-redrive report-s3-ls report-logs-builder report-logs-mailer \
+	llm-hello parse aws-deploy-ai aws-parser-url aws-logs-parser aws-destroy
 
 help:
 	@grep -hE '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -252,6 +255,8 @@ aws-push-image: ## Build and push the API + static frontend image without managi
 		auth_out() { printf '%s\n' "$$auth" | awk -F '\t' -v k="$$1" '$$1 == k { print $$2 }'; }; \
 		test -n "$$(auth_out UserPoolId)" || { echo "No Cognito user pool — run: make aws-deploy-auth"; exit 1; }; \
 		echo "Building static frontend for the Lambda URL"; \
+		parser_url=$$($(call stack-output,$(AI_STACK),ParserUrl) 2>/dev/null | tr -d '[:space:]'); \
+		case "$$parser_url" in ""|None) parser_url="$(NEXT_PUBLIC_PARSER_URL)" ;; esac; \
 		rm -rf frontend/out; \
 		docker build --target export --output type=local,dest=frontend/out \
 			--build-arg NEXT_PUBLIC_API_BASE_URL= \
@@ -259,6 +264,7 @@ aws-push-image: ## Build and push the API + static frontend image without managi
 			--build-arg NEXT_PUBLIC_COGNITO_CLIENT_ID="$$(auth_out UserPoolClientId)" \
 			--build-arg NEXT_PUBLIC_COGNITO_DOMAIN="$$(auth_out HostedDomain)" \
 			--build-arg NEXT_PUBLIC_COGNITO_GOOGLE_ENABLED="$$(auth_out GoogleEnabled)" \
+			--build-arg NEXT_PUBLIC_PARSER_URL="$$parser_url" \
 			./frontend || exit 1; \
 		repo=$$($(call stack-output,$(ECR_STACK),RepositoryUri) | tr -d '[:space:]'); \
 		echo "Pushing $$repo:$(IMAGE_TAG) ($(IMAGE_PLATFORM))"; \
@@ -509,6 +515,68 @@ report-logs-builder: ## View logs of the report-builder Lambda
 report-logs-mailer: ## View logs of the report-mailer Lambda
 	$(require-aws-credentials)
 	$(AWS) logs tail /aws/lambda/$(PROJECT_NAME)-report-mailer --since 15m
+
+llm-hello: ## Step 1: Call Claude on Amazon Bedrock (Mantle) from your laptop
+	$(require-aws-credentials)
+	@if [ -x backend/.venv/Scripts/python.exe ]; then \
+		PYTHONPATH=backend backend/.venv/Scripts/python.exe -m app.ai.agenda --hello; \
+	elif [ -x backend/.venv/bin/python ]; then \
+		PYTHONPATH=backend backend/.venv/bin/python -m app.ai.agenda --hello; \
+	else \
+		$(COMPOSE) exec -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_REGION -e PARSER_MODEL backend python -m app.ai.agenda --hello; \
+	fi
+
+parse: ## Step 2: Parse free-form agenda text: make parse TEXT="Пн 10:00..."
+	$(require-aws-credentials)
+	@test -n "$(TEXT)" || { echo 'Usage: make parse TEXT="Пн 10:00, синк по прайсингу..."'; exit 1; }
+	@if [ -x backend/.venv/Scripts/python.exe ]; then \
+		PYTHONPATH=backend backend/.venv/Scripts/python.exe -m app.ai.agenda "$(TEXT)"; \
+	elif [ -x backend/.venv/bin/python ]; then \
+		PYTHONPATH=backend backend/.venv/bin/python -m app.ai.agenda "$(TEXT)"; \
+	else \
+		$(COMPOSE) exec -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_REGION -e PARSER_MODEL backend python -m app.ai.agenda "$(TEXT)"; \
+	fi
+
+aws-deploy-ai: aws-push ## Deploy the AI agenda parser stack (infra/ai.yml) outside the VPC
+	$(require-aws-credentials)
+	@pool=$$($(call stack-output,$(AUTH_STACK),UserPoolId) 2>/dev/null | tr -d '[:space:]'); \
+		client=$$($(call stack-output,$(AUTH_STACK),UserPoolClientId) | tr -d '[:space:]'); \
+		case "$$pool" in ""|None) echo "No user pool found — run: make aws-deploy-auth"; exit 1 ;; esac; \
+		repo=$$($(call stack-output,$(ECR_STACK),RepositoryUri) | tr -d '[:space:]'); \
+		digest=$$($(AWS) ecr describe-images --repository-name "$${repo#*/}" \
+			--image-ids imageTag=$(IMAGE_TAG) --query 'imageDetails[0].imageDigest' \
+			--output text | tr -d '[:space:]'); \
+		case "$$digest" in ""|None) echo "No ECR image tagged $(IMAGE_TAG)"; exit 1 ;; esac; \
+		image="$$repo@$$digest"; \
+		cors="$(AWS_CORS_ORIGINS)"; \
+		if [ -z "$$cors" ]; then cors="$(or $(CORS_ORIGINS),http://localhost:3000)"; fi; \
+		echo "Deploying AI parser stack ($(AI_STACK)) with model $(PARSER_MODEL)..."; \
+		$(call wait-stack-idle,$(AI_STACK)); \
+		$(call clear-failed-create,$(AI_STACK)); \
+		$(AWS) cloudformation deploy \
+			--stack-name $(AI_STACK) \
+			--template-file infra/ai.yml \
+			--capabilities CAPABILITY_IAM \
+			--no-fail-on-empty-changeset \
+			$(STACK_TAGS) \
+			--parameter-overrides \
+				"ProjectName=$(PROJECT_NAME)" \
+				"ImageUri=$$image" \
+				"Architecture=$(AWS_LAMBDA_ARCH)" \
+				"ParserModel=$(PARSER_MODEL)" \
+				"AppTimezone=$(APP_TIMEZONE)" \
+				"CorsOrigins=$$cors" \
+				"CognitoUserPoolId=$$pool" \
+				"CognitoClientId=$$client" \
+				"AlertEmail=$(REPORTS_RECIPIENT)"
+	@$(MAKE) --no-print-directory aws-parser-url
+
+aws-parser-url: ## Print the deployed agenda parser Function URL
+	@$(call stack-output,$(AI_STACK),ParserUrl)
+
+aws-logs-parser: ## View logs of the agenda-parser Lambda
+	$(require-aws-credentials)
+	$(AWS) logs tail /aws/lambda/$(PROJECT_NAME)-agenda-parser --since 15m
 
 aws-destroy: ## Delete every stack, including the database and its data
 	$(require-aws-credentials)

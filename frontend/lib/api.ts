@@ -2,6 +2,7 @@ import { signOut } from "aws-amplify/auth"
 
 import { getAccessToken } from "@/lib/auth"
 import type {
+  AiSuggestion,
   ApiErrorBody,
   ApiErrorDetail,
   Meeting,
@@ -12,6 +13,9 @@ import type {
 
 export const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000"
+
+export const PARSER_URL =
+  process.env.NEXT_PUBLIC_PARSER_URL || `${API_BASE_URL}/api/v1/ai/parse-agenda`
 
 export class ApiError extends Error {
   readonly code: string
@@ -110,4 +114,94 @@ export function syncMe(idToken: string) {
     method: "POST",
     body: JSON.stringify({ id_token: idToken }),
   })
+}
+
+/**
+ * Calls the standalone agenda-parser Lambda Function URL (or local fallback)
+ * with AbortController support and clear error mapping for 413, 422, 429, and network errors.
+ */
+export async function parseAgendaText(
+  text: string,
+  today: string,
+  tz: string,
+  signal?: AbortSignal,
+): Promise<AiSuggestion> {
+  if (text.length > 10_000) {
+    throw new ApiError(
+      413,
+      "payload_too_large",
+      "The pasted text is too long (maximum 10,000 characters).",
+      [],
+    )
+  }
+
+  const token = await getAccessToken()
+  let response: Response
+  try {
+    response = await fetch(PARSER_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ text, today, tz }),
+      signal,
+      cache: "no-store",
+    })
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw err
+    }
+    throw new ApiError(
+      0,
+      "network_error",
+      "Network failed while reaching the agenda parser. You can type the agenda by hand.",
+      [],
+    )
+  }
+
+  if (response.status === 401) {
+    void signOut()
+    throw new ApiError(401, "unauthorized", "Please sign in to parse agendas.", [])
+  }
+
+  const raw = await response.text()
+  const data = raw ? JSON.parse(raw) : null
+
+  if (!response.ok) {
+    const serverMsg =
+      (data && typeof data.error === "string" ? data.error : data?.error?.message) ?? ""
+    if (response.status === 413) {
+      throw new ApiError(
+        413,
+        "payload_too_large",
+        serverMsg || "The pasted text is too long (maximum 10,000 characters).",
+        [],
+      )
+    }
+    if (response.status === 422) {
+      throw new ApiError(
+        422,
+        "unprocessable_entity",
+        serverMsg || "The model could not find a valid agenda in the pasted text.",
+        [],
+      )
+    }
+    if (response.status === 429 || response.status === 503) {
+      throw new ApiError(
+        response.status,
+        "throttled",
+        serverMsg || "The AI service is busy right now. Please wait a moment or type by hand.",
+        [],
+      )
+    }
+    throw new ApiError(
+      response.status,
+      "parser_error",
+      serverMsg || `Agenda parsing failed (HTTP ${response.status}).`,
+      [],
+    )
+  }
+
+  return data as AiSuggestion
 }

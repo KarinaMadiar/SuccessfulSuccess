@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from pydantic import (
     BaseModel,
@@ -47,6 +48,7 @@ class MeetingCreate(BaseModel):
     starts_at: datetime
     ends_at: datetime
     participants: list[ParticipantCreate] = Field(default_factory=list)
+    ai_suggestion: dict[str, Any] | None = Field(default=None)
 
     @field_validator("name")
     @classmethod
@@ -103,6 +105,7 @@ class MeetingRead(BaseModel):
     starts_at: datetime
     ends_at: datetime
     participants: list[ParticipantRead]
+    ai_suggestion: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
 

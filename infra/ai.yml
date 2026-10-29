@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AI agenda parser stack (Module 6):
+  A standalone Lambda function outside the VPC exposed via a Lambda Function URL,
+  calling Claude on Amazon Bedrock (bedrock-mantle) directly over HTTPS, plus a
+  $5/month AWS Budgets alarm.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: successfulsuccess
+    Description: Prefix for resource names and PROJECT_NAME tag value.
+
+  ImageUri:
+    Type: String
+    Description: Backend container image URI pinned by digest.
+
+  Architecture:
+    Type: String
+    Default: x86_64
+    AllowedValues: [x86_64, arm64]
+    Description: Lambda CPU architecture matching the container image.
+
+  ParserModel:
+    Type: String
+    Default: anthropic.claude-opus-5-5
+    Description: Bedrock model identifier used to parse meeting agendas.
+
+  AppTimezone:
+    Type: String
+    Default: Europe/Kyiv
+    Description: Default timezone for resolving relative dates.
+
+  CorsOrigins:
+    Type: String
+    Default: "*"
+    Description: Comma-separated origins allowed to call the parser Function URL.
+
+  CognitoUserPoolId:
+    Type: String
+    Description: Cognito User Pool ID used to verify Bearer access tokens.
+
+  CognitoClientId:
+    Type: String
+    Description: Cognito User Pool App Client ID.
+
+  AlertEmail:
+    Type: String
+    Default: madiar.pn@ucu.edu.ua
+    Description: Email address for the $5/month AWS Budgets cost alarm.
+
+Resources:
+  # ============================================================================
+  # 1. IAM Role & CloudWatch Log Group
+  # ============================================================================
+
+  ParserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockInferencePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-mantle:CreateInference
+                  - bedrock:InvokeModel
+                Resource: "*"
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  ParserLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-agenda-parser"
+      RetentionInDays: 7
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # 2. Agenda Parser Lambda Function (outside VPC)
+  # ============================================================================
+
+  ParserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-agenda-parser"
+      Description: Parses pasted text into a structured meeting agenda using Claude on Bedrock
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      ImageConfig:
+        Command:
+          - app.ai.agenda_lambda.handler
+      Architectures:
+        - !Ref Architecture
+      Role: !GetAtt ParserRole.Arn
+      MemorySize: 512
+      Timeout: 30
+      LoggingConfig:
+        LogGroup: !Ref ParserLogGroup
+      Environment:
+        Variables:
+          PARSER_MODEL: !Ref ParserModel
+          APP_TIMEZONE: !Ref AppTimezone
+          COGNITO_REGION: !Ref AWS::Region
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPoolId
+          COGNITO_CLIENT_ID: !Ref CognitoClientId
+          LOG_LEVEL: INFO
+      Tags:
+        - Key: PROJECT_NAME
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # 3. Lambda Function URL & Public Invocation Permissions
+  # ============================================================================
+
+  ParserFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ParserFunction.Arn
+      AuthType: NONE
+      InvokeMode: BUFFERED
+      Cors:
+        AllowOrigins: !Split [",", !Ref CorsOrigins]
+        AllowMethods:
+          - POST
+        AllowHeaders:
+          - authorization
+          - content-type
+        MaxAge: 86400
+
+  ParserFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ParserFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  ParserFunctionUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ParserFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  # ============================================================================
+  # 4. AWS Budgets $5 Monthly Cost Alarm (Part 4, Step 6)
+  # ============================================================================
+
+  MonthlyCostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ProjectName}-monthly-5usd-budget"
+        BudgetLimit:
+          Amount: 5
+          Unit: USD
+        TimeUnit: MONTHLY
+        BudgetType: COST
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+Outputs:
+  ParserUrl:
+    Description: HTTPS Function URL of the agenda parser Lambda
+    Value: !GetAtt ParserFunctionUrl.FunctionUrl
+
+  ParserFunctionName:
+    Description: Agenda parser Lambda function name
+    Value: !Ref ParserFunction
+
+  ParserFunctionArn:
+    Description: Agenda parser Lambda function ARN
+    Value: !GetAtt ParserFunction.Arn
+
+  ParserLogGroupName:
+    Description: CloudWatch Log Group for the agenda parser
+    Value: !Ref ParserLogGroup

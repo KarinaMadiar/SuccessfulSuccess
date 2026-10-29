@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # runs in a VPC without internet access, so the deploy passes them in; when
     # empty they are fetched from Cognito on first use.
     cognito_jwks: str = ""
+    parser_model: str = "anthropic.claude-opus-5-5"
+
+    @property
+    def PARSER_MODEL(self) -> str:
+        return self.parser_model
 
     @field_validator("app_timezone")
     @classmethod

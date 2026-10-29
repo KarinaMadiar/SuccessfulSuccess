@@ -126,7 +126,7 @@ export function MeetingDetailsDialog({
             </Button>
             <Button ref={editRef} onClick={() => onEdit(meeting)}>
               <Pencil aria-hidden />
-              Edit
+              Edit / Paste agenda
             </Button>
           </DialogFooter>
         </DialogContent>
